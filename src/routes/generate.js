@@ -4,7 +4,7 @@ const supabase = require('../lib/supabase');
 
 const router = express.Router();
 
-async function getContext(postsLimit = 3, documentIds = []) {
+async function getContext(postsLimit = 3, documentIds = [], specificPostIds = []) {
   const queries = [
     supabase.from('guidelines').select('title, content').order('created_at', { ascending: false }),
     supabase.from('posts').select('title, content').order('created_at', { ascending: false }).limit(postsLimit),
@@ -12,21 +12,32 @@ async function getContext(postsLimit = 3, documentIds = []) {
 
   if (documentIds.length > 0) {
     queries.push(supabase.from('documents').select('title, content').in('id', documentIds));
+  } else {
+    queries.push(Promise.resolve({ data: [], error: null }));
   }
 
-  const [guidelinesRes, recentPostsRes, documentsRes] = await Promise.all(queries);
+  if (specificPostIds.length > 0) {
+    queries.push(supabase.from('posts').select('title, content').in('id', specificPostIds));
+  } else {
+    queries.push(Promise.resolve({ data: [], error: null }));
+  }
+
+  const [guidelinesRes, recentPostsRes, documentsRes, specificPostsRes] = await Promise.all(queries);
 
   if (guidelinesRes.error) console.error('[context] guidelines error:', guidelinesRes.error.message);
   if (recentPostsRes.error) console.error('[context] posts error:', recentPostsRes.error.message);
   if (documentsRes?.error) console.error('[context] documents error:', documentsRes.error.message);
+  if (specificPostsRes?.error) console.error('[context] specific posts error:', specificPostsRes.error.message);
 
   const guidelinesData = guidelinesRes.data || [];
   const postsData = recentPostsRes.data || [];
   const documentsData = documentsRes?.data || [];
+  const specificPostsData = specificPostsRes?.data || [];
 
   console.log(`[context] guidelines fetched: ${guidelinesData.length}`);
   console.log(`[context] recent posts fetched: ${postsData.length} (limit=${postsLimit})`);
   console.log(`[context] documents fetched: ${documentsData.length} (ids=${documentIds.join(', ') || 'none'})`);
+  console.log(`[context] specific posts fetched: ${specificPostsData.length} (ids=${specificPostIds.join(', ') || 'none'})`);
   if (guidelinesData.length === 0) console.warn('[context] ⚠️  no guidelines in DB — AI will not get any style rules');
   if (postsData.length === 0) console.warn('[context] ⚠️  no past posts in DB — AI will not get tone reference');
 
@@ -42,7 +53,11 @@ async function getContext(postsLimit = 3, documentIds = []) {
     .map((d) => `### ${d.title}\n${d.content}`)
     .join('\n\n---\n\n');
 
-  return { guidelines, recentPosts, documents };
+  const specificPosts = specificPostsData
+    .map((p) => `Title: ${p.title}\n\n${p.content}`)
+    .join('\n\n---\n\n');
+
+  return { guidelines, recentPosts, documents, specificPosts };
 }
 
 const BASE_PROMPT = `You are writing a real estate blog in the tone and style of MGP Property (Wingman).
@@ -77,10 +92,11 @@ const BASE_PROMPT = `You are writing a real estate blog in the tone and style of
 6. **Resolution** — Show how a clear, structured approach improves outcomes. Do not hype. Keep it grounded. Reference real process steps if relevant.
 7. **Final Thought** — End with a sharp, simple takeaway. One or two sentences only. Close with a sentence that references MGP Property — e.g. "At MGP Property, we..." — keep it grounded, not a sales pitch.`;
 
-function buildSystemPrompt(guidelines, recentPosts, documents) {
+function buildSystemPrompt(guidelines, recentPosts, documents, specificPosts) {
   return `${BASE_PROMPT}
 ${guidelines ? `\n## Additional Writing Guidelines\n${guidelines}` : ''}
 ${documents ? `\n## Reference Documents (brand assets, case studies — use these as factual reference when relevant)\n${documents}` : ''}
+${specificPosts ? `\n## Specific Source Posts (USE THESE AS PRIMARY SOURCE MATERIAL — pull facts, angles, and arguments from here)\n${specificPosts}` : ''}
 ${recentPosts ? `\n## Past Blog Posts — MANDATORY REFERENCE\nBefore you write a single word, do the following:\n1. Read every past post below carefully\n2. Note how each post opens — what is the first sentence pattern?\n3. Note the subheading style — how are they worded, how often do they appear?\n4. Note paragraph length — how many sentences per paragraph?\n5. Note sentence rhythm — short punchy sentences or longer ones? Mixed?\n6. Note how ideas transition between paragraphs\nOnly after completing this analysis, write the new post replicating that exact style.\nYour output must feel like it came from the same writer as these posts.\n\n${recentPosts}` : '\n## WARNING: No past posts available — follow the tone and structure rules strictly.'}
 
 ## Formatting Requirements
@@ -93,28 +109,34 @@ The "content" field must be the full blog post in markdown, including subheading
 }
 
 // POST /api/generate — generate a new blog post (start of conversation)
-// Body: { title, notes? }
+// Body: { title, notes?, outline?, recentPostsLimit?, documentIds?, specificPostIds? }
 // Returns: { title, content, messages }  — frontend must store `messages` and send it back for edits
 router.post('/', async (req, res) => {
-  const { title, notes, recentPostsLimit, documentIds } = req.body;
+  const { title, notes, outline, recentPostsLimit, documentIds, specificPostIds } = req.body;
 
   if (!title) return res.status(400).json({ error: 'title is required' });
 
   const limit = parseInt(recentPostsLimit) || 3;
   const docIds = Array.isArray(documentIds) ? documentIds : [];
-  const { guidelines, recentPosts, documents } = await getContext(limit, docIds);
+  const postIds = Array.isArray(specificPostIds) ? specificPostIds : [];
+  const { guidelines, recentPosts, documents, specificPosts } = await getContext(limit, docIds, postIds);
+
+  const outlineText = typeof outline === 'string' && outline.trim()
+    ? `\n\nOutline (cover every point, in order):\n${outline.trim()}`
+    : '';
 
   const messages = [
-    { role: 'system', content: buildSystemPrompt(guidelines, recentPosts, documents) },
+    { role: 'system', content: buildSystemPrompt(guidelines, recentPosts, documents, specificPosts) },
     {
       role: 'user',
-      content: `Write a blog post with this title: "${title}"${notes ? `\n\nNotes: ${notes}` : ''}`,
+      content: `Write a blog post with this title: "${title}"${notes ? `\n\nNotes: ${notes}` : ''}${outlineText}`,
     },
   ];
 
   console.log(`\n========== [generate] ==========`);
   console.log(`title: "${title}"`);
   console.log(`notes: "${notes || ''}"`);
+  console.log(`outline provided: ${outlineText ? 'yes' : 'no'}`);
   console.log(`recentPostsLimit: ${limit}`);
   console.log(`\n--- SYSTEM PROMPT SENT TO AI ---`);
   console.log(messages[0].content);
@@ -185,6 +207,109 @@ router.post('/refine', async (req, res) => {
       messages: [...updatedMessages, { role: 'assistant', content: assistantMessage.content }],
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/generate/outline — generate a list of talking points (sense-check stage)
+// Body: { title, notes?, recentPostsLimit?, documentIds? }
+// Returns: { outline: string[], messages }  — frontend stores `messages` and sends back to refine or to /generate
+router.post('/outline', async (req, res) => {
+  const { title, notes, recentPostsLimit, documentIds, specificPostIds } = req.body;
+
+  if (!title) return res.status(400).json({ error: 'title is required' });
+
+  const limit = parseInt(recentPostsLimit) || 3;
+  const docIds = Array.isArray(documentIds) ? documentIds : [];
+  const postIds = Array.isArray(specificPostIds) ? specificPostIds : [];
+  const { guidelines, recentPosts, documents, specificPosts } = await getContext(limit, docIds, postIds);
+
+  const systemPrompt = `${buildSystemPrompt(guidelines, recentPosts, documents, specificPosts)}
+
+## Current Task: Outline Only
+Do NOT write the full blog post yet. Instead, produce a list of 6–10 talking points (the angles, arguments, and evidence) that the post should cover, grounded in the MGP brand voice and any reference documents above. Each point should be a single sentence describing the idea — not a full paragraph.
+
+Respond with JSON: { "outline": ["point 1", "point 2", ...] }`;
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    {
+      role: 'user',
+      content: `Generate the outline for a blog post titled: "${title}"${notes ? `\n\nNotes: ${notes}` : ''}`,
+    },
+  ];
+
+  console.log(`\n========== [outline] ==========`);
+  console.log(`title: "${title}"`);
+  console.log(`notes: "${notes || ''}"`);
+  console.log(`recentPostsLimit: ${limit}`);
+  console.log(`================================\n`);
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || 'gpt-4o',
+      messages,
+      response_format: { type: 'json_object' },
+      temperature: 0.7,
+    });
+
+    const assistantMessage = completion.choices[0].message;
+    const result = JSON.parse(assistantMessage.content);
+    const outline = Array.isArray(result.outline) ? result.outline : [];
+
+    console.log(`\n--- AI OUTLINE (${outline.length} points) ---`);
+    outline.forEach((p, i) => console.log(`${i + 1}. ${p}`));
+    console.log(`================================\n`);
+
+    res.json({
+      outline,
+      messages: [...messages, { role: 'assistant', content: assistantMessage.content }],
+    });
+  } catch (err) {
+    console.error(`[outline] error — ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/generate/outline/refine — chat-refine the outline
+// Body: { messages, instruction }
+// Returns: { outline: string[], messages }
+router.post('/outline/refine', async (req, res) => {
+  const { messages, instruction } = req.body;
+
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages array is required' });
+  }
+  if (!instruction) {
+    return res.status(400).json({ error: 'instruction is required' });
+  }
+
+  const updatedMessages = [
+    ...messages,
+    {
+      role: 'user',
+      content: `${instruction}\n\nRespond with the full updated outline as JSON: { "outline": ["point 1", "point 2", ...] }`,
+    },
+  ];
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || 'gpt-4o',
+      messages: updatedMessages,
+      response_format: { type: 'json_object' },
+      temperature: 0.7,
+    });
+
+    const assistantMessage = completion.choices[0].message;
+    const result = JSON.parse(assistantMessage.content);
+    const outline = Array.isArray(result.outline) ? result.outline : [];
+
+    res.json({
+      outline,
+      messages: [...updatedMessages, { role: 'assistant', content: assistantMessage.content }],
+    });
+  } catch (err) {
+    console.error(`[outline/refine] error — ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
