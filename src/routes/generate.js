@@ -95,7 +95,7 @@ const BASE_PROMPT = `You are writing a real estate blog in the tone and style of
 function buildSystemPrompt(guidelines, recentPosts, documents, specificPosts) {
   return `${BASE_PROMPT}
 ${guidelines ? `\n## Additional Writing Guidelines\n${guidelines}` : ''}
-${documents ? `\n## Reference Documents (brand assets, case studies — use these as factual reference when relevant)\n${documents}` : ''}
+${documents ? `\n## Reference Documents — Case Studies & Brand Assets (MANDATORY USE)\nThe documents below are case studies and brand assets you MUST weave into the post as concrete examples. For each document provided:\n- Reference it explicitly in the post as an example (e.g. "For example, in one recent case…", "We saw this with a recent vendor…").\n- Pull specific details, numbers, scenarios, or quotes from the document — do not summarise vaguely.\n- Use it inside the Mechanism, Contrast, or Impact section where it fits best.\n- If multiple documents are provided, use each one at least once.\nDo NOT invent case studies — only use the ones below.\n\n${documents}` : ''}
 ${specificPosts ? `\n## Specific Source Posts (USE THESE AS PRIMARY SOURCE MATERIAL — pull facts, angles, and arguments from here)\n${specificPosts}` : ''}
 ${recentPosts ? `\n## Past Blog Posts — MANDATORY REFERENCE\nBefore you write a single word, do the following:\n1. Read every past post below carefully\n2. Note how each post opens — what is the first sentence pattern?\n3. Note the subheading style — how are they worded, how often do they appear?\n4. Note paragraph length — how many sentences per paragraph?\n5. Note sentence rhythm — short punchy sentences or longer ones? Mixed?\n6. Note how ideas transition between paragraphs\nOnly after completing this analysis, write the new post replicating that exact style.\nYour output must feel like it came from the same writer as these posts.\n\n${recentPosts}` : '\n## WARNING: No past posts available — follow the tone and structure rules strictly.'}
 
@@ -231,6 +231,7 @@ Do NOT write the full blog post yet. Produce a structured outline of 4–7 MAIN 
 
 - Main points = the section-level ideas of the post (one short sentence each).
 - Sub-points = the supporting detail under each main point (one specific sentence each — not vague).
+- If any Reference Documents (case studies / brand assets) are provided above, EVERY case study MUST appear as a sub-point somewhere in the outline. Phrase it as a concrete example, e.g. "Example: [specific detail from the case study]" — name the document or scenario so it is clear which case study is being referenced.
 
 Respond with JSON in this exact shape:
 { "outline": [
