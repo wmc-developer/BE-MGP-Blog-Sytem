@@ -227,9 +227,16 @@ router.post('/outline', async (req, res) => {
   const systemPrompt = `${buildSystemPrompt(guidelines, recentPosts, documents, specificPosts)}
 
 ## Current Task: Outline Only
-Do NOT write the full blog post yet. Instead, produce a list of 6–10 talking points (the angles, arguments, and evidence) that the post should cover, grounded in the MGP brand voice and any reference documents above. Each point should be a single sentence describing the idea — not a full paragraph.
+Do NOT write the full blog post yet. Produce a structured outline of 4–7 MAIN points. Each main point must have 2–4 SUB-points underneath it that add detail (specific arguments, examples, evidence, or angles to cover under that main point). Ground every point in the MGP brand voice and any reference documents above.
 
-Respond with JSON: { "outline": ["point 1", "point 2", ...] }`;
+- Main points = the section-level ideas of the post (one short sentence each).
+- Sub-points = the supporting detail under each main point (one specific sentence each — not vague).
+
+Respond with JSON in this exact shape:
+{ "outline": [
+  { "main": "Main point 1", "subs": ["sub-point 1a", "sub-point 1b", "sub-point 1c"] },
+  { "main": "Main point 2", "subs": ["sub-point 2a", "sub-point 2b"] }
+] }`;
 
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -255,10 +262,13 @@ Respond with JSON: { "outline": ["point 1", "point 2", ...] }`;
 
     const assistantMessage = completion.choices[0].message;
     const result = JSON.parse(assistantMessage.content);
-    const outline = Array.isArray(result.outline) ? result.outline : [];
+    const outline = normalizeOutline(result.outline);
 
-    console.log(`\n--- AI OUTLINE (${outline.length} points) ---`);
-    outline.forEach((p, i) => console.log(`${i + 1}. ${p}`));
+    console.log(`\n--- AI OUTLINE (${outline.length} main points) ---`);
+    outline.forEach((p, i) => {
+      console.log(`${i + 1}. ${p.main}`);
+      p.subs.forEach((s, j) => console.log(`   ${i + 1}.${j + 1} ${s}`));
+    });
     console.log(`================================\n`);
 
     res.json({
@@ -270,6 +280,23 @@ Respond with JSON: { "outline": ["point 1", "point 2", ...] }`;
     res.status(500).json({ error: err.message });
   }
 });
+
+// Coerce AI output into [{ main, subs: [] }] regardless of whether it returned the new or old shape
+function normalizeOutline(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      if (typeof item === 'string') return { main: item, subs: [] };
+      if (item && typeof item === 'object') {
+        const main = typeof item.main === 'string' ? item.main : '';
+        const subs = Array.isArray(item.subs) ? item.subs.filter((s) => typeof s === 'string') : [];
+        if (!main) return null;
+        return { main, subs };
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
 
 // POST /api/generate/outline/refine — chat-refine the outline
 // Body: { messages, instruction }
@@ -288,7 +315,7 @@ router.post('/outline/refine', async (req, res) => {
     ...messages,
     {
       role: 'user',
-      content: `${instruction}\n\nRespond with the full updated outline as JSON: { "outline": ["point 1", "point 2", ...] }`,
+      content: `${instruction}\n\nRespond with the full updated outline as JSON in this exact shape:\n{ "outline": [ { "main": "...", "subs": ["...", "..."] }, ... ] }`,
     },
   ];
 
@@ -302,7 +329,7 @@ router.post('/outline/refine', async (req, res) => {
 
     const assistantMessage = completion.choices[0].message;
     const result = JSON.parse(assistantMessage.content);
-    const outline = Array.isArray(result.outline) ? result.outline : [];
+    const outline = normalizeOutline(result.outline);
 
     res.json({
       outline,
