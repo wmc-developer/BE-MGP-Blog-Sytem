@@ -1,6 +1,66 @@
 const express = require('express');
+const https = require('https');
+const http = require('http');
 const openai = require('../lib/openai');
 const supabase = require('../lib/supabase');
+
+// Fetch a URL and return the raw text body
+function fetchUrl(url) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https') ? https : http;
+    client.get(url, { headers: { 'User-Agent': 'MGPBlogs/1.0' } }, (res) => {
+      // follow one redirect
+      if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
+        return fetchUrl(res.headers.location).then(resolve).catch(reject);
+      }
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => resolve(data));
+    }).on('error', reject);
+  });
+}
+
+// Pull <title> and <description> from RSS items (no XML dependency)
+function parseRssItems(xml, limit = 8) {
+  const items = [];
+  const itemRe = /<item[\s>]([\s\S]*?)<\/item>/gi;
+  const titleRe = /<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>|<title>([\s\S]*?)<\/title>/i;
+  const descRe = /<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>|<description>([\s\S]*?)<\/description>/i;
+  let m;
+  while ((m = itemRe.exec(xml)) !== null && items.length < limit) {
+    const block = m[1];
+    const titleM = titleRe.exec(block);
+    const descM = descRe.exec(block);
+    const title = (titleM?.[1] || titleM?.[2] || '').trim().replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    const desc = (descM?.[1] || descM?.[2] || '').trim().replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').slice(0, 200);
+    if (title) items.push({ title, desc });
+  }
+  return items;
+}
+
+// Fetch news headlines from Australian property RSS feeds
+async function fetchPropertyNews() {
+  const feeds = [
+    { name: 'Domain', url: 'https://www.domain.com.au/news/feed/' },
+    { name: 'RealEstate.com.au', url: 'https://www.realestate.com.au/news/feed/' },
+    { name: 'ABC News Property', url: 'https://www.abc.net.au/news/feed/51892/rss.xml' },
+    { name: 'Perth Now Property', url: 'https://www.perthnow.com.au/real-estate/rss' },
+  ];
+
+  const results = await Promise.allSettled(feeds.map(async (feed) => {
+    const xml = await fetchUrl(feed.url);
+    const items = parseRssItems(xml, 6);
+    return { source: feed.name, items };
+  }));
+
+  const news = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value.items.length > 0) {
+      news.push(r.value);
+    }
+  }
+  return news;
+}
 
 const router = express.Router();
 
@@ -298,6 +358,113 @@ function normalizeOutline(raw) {
     })
     .filter(Boolean);
 }
+
+// POST /api/generate/topics — suggest 5 new blog topic ideas, informed by current AU property news
+// Body: { recentPostsLimit? }
+// Returns: { topics: [{ title, why, isHot?, newsSource? }], newsHeadlines: [...] }
+router.post('/topics', async (req, res) => {
+  const { recentPostsLimit } = req.body;
+  const limit = parseInt(recentPostsLimit) || 50;
+
+  // Fetch existing post titles + live news in parallel
+  const [postsResult, news] = await Promise.all([
+    supabase.from('posts').select('title').order('created_at', { ascending: false }).limit(limit),
+    fetchPropertyNews().catch((err) => {
+      console.error('[topics] news fetch failed:', err.message);
+      return [];
+    }),
+  ]);
+
+  if (postsResult.error) {
+    console.error('[topics] posts fetch error:', postsResult.error.message);
+    return res.status(500).json({ error: postsResult.error.message });
+  }
+
+  const existingTitles = (postsResult.data || []).map((p) => p.title);
+
+  // Format news for the prompt
+  let newsBlock = '';
+  const allHeadlines = [];
+  if (news.length > 0) {
+    newsBlock = '\n\n## Current Australian Property News (this week)\nUse these headlines to identify HOT topics that are trending right now. For any suggestion that ties to a news story, mark it as a hot topic and reference the news source.\n\n';
+    for (const feed of news) {
+      newsBlock += `**${feed.source}:**\n`;
+      for (const item of feed.items) {
+        newsBlock += `- ${item.title}${item.desc ? ` — ${item.desc}` : ''}\n`;
+        allHeadlines.push({ source: feed.source, title: item.title });
+      }
+      newsBlock += '\n';
+    }
+  }
+
+  const systemPrompt = `You are a content strategist for MGP Property, a real estate agency in Perth, Western Australia specialising in the southern suburbs (Melville, Alfred Cove, Myaree, Mount Pleasant, Ardross, Booragoon, Applecross, Bicton, Attadale).
+
+MGP Property's main service areas:
+- Residential property sales
+- Property leasing and management
+- Property development
+- Property appraisals and valuations
+
+Their blog topics typically cover:
+- Seller guidance (preparation, staging, timing, negotiation, agent selection)
+- Buyer education (market tactics, priorities, open homes)
+- Market analysis and suburb-specific data (Perth southern suburbs)
+- Agency philosophy and process transparency
+- Local lifestyle and community content
+
+The blog tone is: direct, clear, no fluff, no generic marketing, no emotional storytelling. Written for serious sellers and buyers in Perth's southern suburbs.
+
+Your task: suggest exactly 5 NEW blog topic ideas that MGP Property has NOT yet written about. Mix of:
+- Topics that fill a content gap in their existing posts
+- At least 1–2 HOT topics tied directly to current Australian property news headlines provided below
+
+Each suggestion must:
+- Be a specific, concrete topic angle — not generic (e.g. NOT "tips for selling your home" but "Why the first 7 days on market determine your final sale price in Perth's southern suburbs")
+- Be relevant to Perth's southern suburbs real estate market
+- Fit the MGP Property brand voice (direct, data-driven, consultative)
+- For hot topics: clearly connect to the news story and explain how MGP's angle on it would be relevant to their clients
+
+Respond with JSON: { "topics": [ { "title": "...", "why": "...", "isHot": false, "newsSource": "" }, ... ] }
+- "title": sharp, specific blog post title
+- "why": 1–2 sentences — why this topic now, what gap or news angle it addresses
+- "isHot": true if this is tied to a current news story, false otherwise
+- "newsSource": name of the news source if isHot is true, otherwise empty string`;
+
+  const existingList = existingTitles.length > 0
+    ? `\n\nAlready published posts (DO NOT suggest similar topics):\n${existingTitles.map((t, i) => `${i + 1}. ${t}`).join('\n')}`
+    : '\n\nNo posts published yet.';
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: `Suggest 5 new blog topic ideas for MGP Property.${existingList}${newsBlock}` },
+  ];
+
+  console.log(`\n========== [topics] ==========`);
+  console.log(`existing posts checked: ${existingTitles.length}`);
+  console.log(`news feeds fetched: ${news.length} (${allHeadlines.length} headlines)`);
+  console.log(`================================\n`);
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL || 'gpt-4o',
+      messages,
+      response_format: { type: 'json_object' },
+      temperature: 0.8,
+    });
+
+    const result = JSON.parse(completion.choices[0].message.content);
+    const topics = Array.isArray(result.topics) ? result.topics : [];
+
+    console.log(`--- AI suggested ${topics.length} topics ---`);
+    topics.forEach((t, i) => console.log(`${i + 1}. ${t.isHot ? '🔥 HOT' : '   '} ${t.title}`));
+    console.log(`================================\n`);
+
+    res.json({ topics, newsHeadlines: allHeadlines });
+  } catch (err) {
+    console.error(`[topics] error — ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // POST /api/generate/outline/refine — chat-refine the outline
 // Body: { messages, instruction }
