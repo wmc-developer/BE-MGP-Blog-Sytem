@@ -26,14 +26,17 @@ function parseRssItems(xml, limit = 8) {
   const itemRe = /<item[\s>]([\s\S]*?)<\/item>/gi;
   const titleRe = /<title><!\[CDATA\[([\s\S]*?)\]\]><\/title>|<title>([\s\S]*?)<\/title>/i;
   const descRe = /<description><!\[CDATA\[([\s\S]*?)\]\]><\/description>|<description>([\s\S]*?)<\/description>/i;
+  const linkRe = /<link><!\[CDATA\[([\s\S]*?)\]\]><\/link>|<link>([\s\S]*?)<\/link>/i;
   let m;
   while ((m = itemRe.exec(xml)) !== null && items.length < limit) {
     const block = m[1];
     const titleM = titleRe.exec(block);
     const descM = descRe.exec(block);
+    const linkM = linkRe.exec(block);
     const title = (titleM?.[1] || titleM?.[2] || '').trim().replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
     const desc = (descM?.[1] || descM?.[2] || '').trim().replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').slice(0, 200);
-    if (title) items.push({ title, desc });
+    const link = (linkM?.[1] || linkM?.[2] || '').trim();
+    if (title) items.push({ title, desc, link });
   }
   return items;
 }
@@ -361,7 +364,7 @@ function normalizeOutline(raw) {
 
 // POST /api/generate/topics — suggest 5 new blog topic ideas, informed by current AU property news
 // Body: { recentPostsLimit? }
-// Returns: { topics: [{ title, why, isHot?, newsSource? }], newsHeadlines: [...] }
+// Returns: { topics: [{ title, why, isHot?, newsSource?, newsHeadline?, newsUrl? }], newsHeadlines: [...] }
 router.post('/topics', async (req, res) => {
   const { recentPostsLimit } = req.body;
   const limit = parseInt(recentPostsLimit) || 50;
@@ -391,7 +394,7 @@ router.post('/topics', async (req, res) => {
       newsBlock += `**${feed.source}:**\n`;
       for (const item of feed.items) {
         newsBlock += `- ${item.title}${item.desc ? ` — ${item.desc}` : ''}\n`;
-        allHeadlines.push({ source: feed.source, title: item.title });
+        allHeadlines.push({ source: feed.source, title: item.title, link: item.link || '' });
       }
       newsBlock += '\n';
     }
@@ -424,11 +427,12 @@ Each suggestion must:
 - Fit the MGP Property brand voice (direct, data-driven, consultative)
 - For hot topics: clearly connect to the news story and explain how MGP's angle on it would be relevant to their clients
 
-Respond with JSON: { "topics": [ { "title": "...", "why": "...", "isHot": false, "newsSource": "" }, ... ] }
+Respond with JSON: { "topics": [ { "title": "...", "why": "...", "isHot": false, "newsSource": "", "newsHeadline": "" }, ... ] }
 - "title": sharp, specific blog post title
 - "why": 1–2 sentences — why this topic now, what gap or news angle it addresses
 - "isHot": true if this is tied to a current news story, false otherwise
-- "newsSource": name of the news source if isHot is true, otherwise empty string`;
+- "newsSource": name of the news source if isHot is true, otherwise empty string
+- "newsHeadline": if isHot is true, copy the EXACT headline text from the news block below that inspired this topic — character-for-character match. Otherwise empty string.`;
 
   const existingList = existingTitles.length > 0
     ? `\n\nAlready published posts (DO NOT suggest similar topics):\n${existingTitles.map((t, i) => `${i + 1}. ${t}`).join('\n')}`
@@ -453,10 +457,27 @@ Respond with JSON: { "topics": [ { "title": "...", "why": "...", "isHot": false,
     });
 
     const result = JSON.parse(completion.choices[0].message.content);
-    const topics = Array.isArray(result.topics) ? result.topics : [];
+    const rawTopics = Array.isArray(result.topics) ? result.topics : [];
+
+    // For hot topics, match the AI's quoted headline back to our headline list
+    // to attach the real source + url (so the AI can't hallucinate them).
+    const normalize = (s) => (s || '').toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+    const topics = rawTopics.map((t) => {
+      if (!t.isHot || !t.newsHeadline) return t;
+      const target = normalize(t.newsHeadline);
+      let match = allHeadlines.find((h) => normalize(h.title) === target);
+      if (!match) {
+        // fall back to a contains match
+        match = allHeadlines.find((h) => normalize(h.title).includes(target) || target.includes(normalize(h.title)));
+      }
+      if (match) {
+        return { ...t, newsHeadline: match.title, newsSource: match.source, newsUrl: match.link || '' };
+      }
+      return t;
+    });
 
     console.log(`--- AI suggested ${topics.length} topics ---`);
-    topics.forEach((t, i) => console.log(`${i + 1}. ${t.isHot ? '🔥 HOT' : '   '} ${t.title}`));
+    topics.forEach((t, i) => console.log(`${i + 1}. ${t.isHot ? '🔥 HOT' : '   '} ${t.title}${t.newsHeadline ? ` (← ${t.newsHeadline})` : ''}`));
     console.log(`================================\n`);
 
     res.json({ topics, newsHeadlines: allHeadlines });
